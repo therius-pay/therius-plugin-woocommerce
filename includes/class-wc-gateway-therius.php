@@ -522,10 +522,18 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         }
 
         // Real status strings + action field, per therius-public-api/handlers_payment.go:
-        // status is "pending_ddc" (DDC/fingerprint) or "pending_3ds" (challenge) — NOT
-        // "pending_challenge" — and the action payload key is "actionRequired", not "nextAction".
-        $challenge_statuses = array( 'pending_ddc', 'pending_3ds' );
-        if ( isset( $data['status'] ) && in_array( $data['status'], $challenge_statuses, true ) && ! empty( $data['actionRequired'] ) ) {
+        // status is "pending_ddc" (DDC/fingerprint) or "pending_3ds" (challenge) for the
+        // internal 3DS pipeline — NOT "pending_challenge" — and the action payload key
+        // is "actionRequired", not "nextAction". Every OTHER provider-native action (ACH
+        // microdeposit verification, boleto/konbini vouchers, bank redirects, Plaid Link)
+        // carries actionRequired alongside the generic status "pending" instead, so this
+        // must be gated on actionRequired's presence alone, not on the two named 3DS
+        // statuses — gating on those meant an ACH purchase's actionRequired was silently
+        // dropped here, 'pending' fell through into $accepted_statuses below as if the
+        // order were final, and the shopper was redirected straight to the thank-you page
+        // having never seen the microdeposit verification popup, leaving the mandate
+        // permanently incomplete.
+        if ( ! empty( $data['actionRequired'] ) ) {
             return array(
                 'result'             => 'success',
                 'redirect'           => '#therius-3ds', // Intercepted by JS
