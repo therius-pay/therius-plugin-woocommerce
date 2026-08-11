@@ -327,9 +327,26 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             'shopper'   => array(
                 'email' => $order->get_billing_email(),
                 'name'  => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
-            )
+            ),
+            // This PHP request IS the customer's own checkout-page form
+            // submission (see therius-checkout.js's triggerWooCommerceSubmit,
+            // which injects the SDK's collected data into the WooCommerce
+            // checkout form and submits it normally) — so $_SERVER here still
+            // carries the real shopper browser's headers/IP, not WordPress's
+            // own. Required for 3DS (therius-3ds's browser_info fields) and,
+            // more strictly, for Stripe ACH's mandate_data.customer_acceptance:
+            // Stripe hard-rejects an empty user_agent rather than silently
+            // accepting it (handlers_payment.go only sets gwReq.UserAgent when
+            // browserInfo is present at all — omitting this block entirely
+            // left every WooCommerce-originated ACH purchase failing with
+            // "You passed an empty string for
+            // 'mandate_data[customer_acceptance][online][user_agent]'").
+            'browserInfo' => array(
+                'userAgent' => isset( $_SERVER['HTTP_USER_AGENT'] ) ? wc_clean( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : '',
+                'ipAddress' => $order->get_customer_ip_address(),
+            ),
         );
-        
+
         $customer_id = $order->get_customer_id();
         if ( ! empty( $customer_id ) ) {
             $body['shopper']['id'] = strval( $customer_id );
