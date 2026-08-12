@@ -60,6 +60,18 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
 
         // Modify checkout fields based on Therius config
         add_filter( 'woocommerce_checkout_fields', array( $this, 'filter_checkout_fields' ) );
+
+        // Checkout Blocks pre-order flow (see class-wc-therius-blocks-support.php
+        // and assets/js/therius-checkout-blocks.js) — the Store API's single
+        // /checkout call has no room to pause mid-flow for DDC/3DS the way the
+        // classic form-submit dance does, so the Blocks widget drives the whole
+        // purchase attempt itself via these two AJAX actions BEFORE Blocks ever
+        // creates the real order, then process_payment() below just applies the
+        // already-verified stashed outcome once the order exists.
+        add_action( 'wp_ajax_therius_blocks_attempt', array( $this, 'ajax_blocks_attempt' ) );
+        add_action( 'wp_ajax_nopriv_therius_blocks_attempt', array( $this, 'ajax_blocks_attempt' ) );
+        add_action( 'wp_ajax_therius_blocks_finalize', array( $this, 'ajax_blocks_finalize' ) );
+        add_action( 'wp_ajax_nopriv_therius_blocks_finalize', array( $this, 'ajax_blocks_finalize' ) );
     }
 
     /**
@@ -282,20 +294,192 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
     }
 
     /**
-     * Build a card.nonceData/tokenData.cardAddress payload from the order's
+     * Normalize a WC_Order's billing/customer data into the flat shape
+     * build_purchase_body()/build_card_address() read — lets those methods
+     * stay agnostic to whether a real order exists yet (classic checkout) or
+     * not (Checkout Blocks pre-order attempt — see context_from_cart()).
+     */
+    private function context_from_order( $order ) {
+        return array(
+            'email'       => $order->get_billing_email(),
+            'first_name'  => $order->get_billing_first_name(),
+            'last_name'   => $order->get_billing_last_name(),
+            'address1'    => $order->get_billing_address_1(),
+            'address2'    => $order->get_billing_address_2(),
+            'city'        => $order->get_billing_city(),
+            'state'       => $order->get_billing_state(),
+            'country'     => $order->get_billing_country(),
+            'postcode'    => $order->get_billing_postcode(),
+            'currency'    => $order->get_currency(),
+            'total'       => $order->get_total(),
+            'customer_id' => $order->get_customer_id(),
+        );
+    }
+
+    /**
+     * Same shape as context_from_order(), sourced from the current cart/
+     * customer session — used by the Checkout Blocks pre-order AJAX handlers,
+     * which run BEFORE any WC_Order exists (Blocks only creates the order as
+     * part of its single /checkout Store API call, after our JS has already
+     * driven the whole purchase attempt to a final outcome — see
+     * class-wc-therius-blocks-support.php).
+     */
+    private function context_from_cart() {
+        $customer = WC()->customer;
+        return array(
+            'email'       => $customer ? $customer->get_billing_email() : '',
+            'first_name'  => $customer ? $customer->get_billing_first_name() : '',
+            'last_name'   => $customer ? $customer->get_billing_last_name() : '',
+            'address1'    => $customer ? $customer->get_billing_address_1() : '',
+            'address2'    => $customer ? $customer->get_billing_address_2() : '',
+            'city'        => $customer ? $customer->get_billing_city() : '',
+            'state'       => $customer ? $customer->get_billing_state() : '',
+            'country'     => $customer ? $customer->get_billing_country() : '',
+            'postcode'    => $customer ? $customer->get_billing_postcode() : '',
+            'currency'    => get_woocommerce_currency(),
+            // Server-side re-derivation of the charge amount — never trust a
+            // client-supplied amount, same principle as any purchase endpoint.
+            'total'       => WC()->cart ? WC()->cart->get_total( 'edit' ) : 0,
+            'customer_id' => get_current_user_id(),
+        );
+    }
+
+    /**
+     * Build a card.nonceData/tokenData.cardAddress payload from the context's
      * stored billing address, with the widget-collected shopper override
      * (CollectedShopperInfo, see onNonce/onSavedMethodSelected in
-     * therius-checkout.js) applied field-by-field where present/non-empty.
+     * therius-checkout.js / therius-checkout-blocks.js) applied field-by-field
+     * where present/non-empty.
      */
-    private function build_card_address( $order, $shopper_override ) {
+    private function build_card_address( $ctx, $shopper_override ) {
         return array(
-            'address1'    => ! empty( $shopper_override['address1'] ) ? sanitize_text_field( $shopper_override['address1'] ) : $order->get_billing_address_1(),
-            'address2'    => $order->get_billing_address_2(),
-            'city'        => ! empty( $shopper_override['city'] ) ? sanitize_text_field( $shopper_override['city'] ) : $order->get_billing_city(),
-            'state'       => ! empty( $shopper_override['state'] ) ? sanitize_text_field( $shopper_override['state'] ) : $order->get_billing_state(),
-            'countryCode' => ! empty( $shopper_override['country'] ) ? sanitize_text_field( $shopper_override['country'] ) : $order->get_billing_country(),
-            'postalCode'  => ! empty( $shopper_override['postalCode'] ) ? sanitize_text_field( $shopper_override['postalCode'] ) : $order->get_billing_postcode(),
+            'address1'    => ! empty( $shopper_override['address1'] ) ? sanitize_text_field( $shopper_override['address1'] ) : $ctx['address1'],
+            'address2'    => $ctx['address2'],
+            'city'        => ! empty( $shopper_override['city'] ) ? sanitize_text_field( $shopper_override['city'] ) : $ctx['city'],
+            'state'       => ! empty( $shopper_override['state'] ) ? sanitize_text_field( $shopper_override['state'] ) : $ctx['state'],
+            'countryCode' => ! empty( $shopper_override['country'] ) ? sanitize_text_field( $shopper_override['country'] ) : $ctx['country'],
+            'postalCode'  => ! empty( $shopper_override['postalCode'] ) ? sanitize_text_field( $shopper_override['postalCode'] ) : $ctx['postcode'],
         );
+    }
+
+    /**
+     * Build the /payment/purchase request body — shared by the classic
+     * process_payment() flow (real $order, order-number-derived order_code)
+     * and the Checkout Blocks pre-order AJAX flow (context_from_cart(), a
+     * client-minted order_code since no order exists yet). Reads the
+     * method-specific payload from $_POST either way — both the classic
+     * form-submit and the Blocks admin-ajax POST use identical field names
+     * (therius_nonce, therius_apm_data, etc.), so there's nothing to branch on
+     * here beyond which $ctx/$order_code the caller passes in. Does NOT set
+     * `key`/`merchantCode`/`orderCode`/`paymentCode` — callers add those
+     * (paymentCode needs the fully-built body for its hash).
+     */
+    private function build_purchase_body( $ctx, $therius_method, $shopper_override ) {
+        $body = array(
+            'amount'      => array(
+                'value'    => $this->to_minor_units( $ctx['total'], $ctx['currency'] ),
+                'currency' => $ctx['currency'],
+                'exponent' => $this->currency_exponent( $ctx['currency'] ),
+            ),
+            'shopper'     => array(
+                'email' => ! empty( $shopper_override['email'] ) ? sanitize_email( $shopper_override['email'] ) : $ctx['email'],
+                'name'  => ! empty( $shopper_override['name'] ) ? sanitize_text_field( $shopper_override['name'] ) : trim( $ctx['first_name'] . ' ' . $ctx['last_name'] ),
+            ),
+            // See the identical comment on this block in the pre-refactor
+            // process_payment() history — required for 3DS + Stripe ACH's
+            // mandate_data.customer_acceptance. Valid for the Blocks AJAX path
+            // too: it's still the real shopper's own browser making this
+            // request (admin-ajax.php), not a server-to-server call.
+            'browserInfo' => array(
+                'userAgent' => isset( $_SERVER['HTTP_USER_AGENT'] ) ? wc_clean( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : '',
+                'ipAddress' => WC_Geolocation::get_ip_address(),
+            ),
+        );
+
+        if ( ! empty( $ctx['customer_id'] ) ) {
+            $body['shopper']['id'] = strval( $ctx['customer_id'] );
+        }
+
+        if ( 'card' === $therius_method ) {
+            $nonce = isset( $_POST['therius_nonce'] ) ? wc_clean( $_POST['therius_nonce'] ) : '';
+            if ( empty( $nonce ) ) {
+                throw new Exception( __( 'Payment error: Missing Therius payment nonce.', 'therius-woocommerce' ) );
+            }
+            $body['card'] = array(
+                'nonceData' => array(
+                    'nonce'          => $nonce,
+                    'cardholderName' => ! empty( $shopper_override['name'] ) ? sanitize_text_field( $shopper_override['name'] ) : trim( $ctx['first_name'] . ' ' . $ctx['last_name'] ),
+                    'cardAddress'    => $this->build_card_address( $ctx, $shopper_override ),
+                ),
+            );
+
+            // The widget's own "save my card" checkbox state — see the onNonce
+            // comment in therius-checkout.js for why this arrives as a separate
+            // hidden field rather than something read off the order. The API
+            // requires shopper.id whenever tokenize is true (400s otherwise);
+            // the widget itself only renders the checkbox for an identified
+            // shopper (session-bound customerId, i.e. a logged-in user — see
+            // customer_id above), so in practice this should never fire for a
+            // guest checkout, but skip tokenizing rather than let the whole
+            // payment fail if it somehow does.
+            $vault_consent = isset( $_POST['therius_vault_consent'] ) && '1' === wc_clean( $_POST['therius_vault_consent'] );
+            if ( $vault_consent && ! empty( $body['shopper']['id'] ) ) {
+                $body['card']['nonceData']['tokenize'] = true;
+            }
+        } elseif ( 'saved_method' === $therius_method ) {
+            $token = isset( $_POST['therius_saved_token'] ) ? wc_clean( $_POST['therius_saved_token'] ) : '';
+            if ( empty( $token ) ) {
+                throw new Exception( __( 'Payment error: Missing saved card token.', 'therius-woocommerce' ) );
+            }
+            // Same endpoint (/payment/purchase) as a fresh card — card.tokenData.token
+            // is the "reuse a vaulted card" path (resolveCard in handlers_payment.go),
+            // parallel to card.nonceData for a new card.
+            $body['card'] = array(
+                'tokenData' => array(
+                    'token'       => $token,
+                    'cardAddress' => $this->build_card_address( $ctx, $shopper_override ),
+                ),
+            );
+        } elseif ( 'click_to_pay' === $therius_method ) {
+            $ctp_data = isset( $_POST['therius_click_to_pay_data'] ) ? json_decode( wp_unslash( $_POST['therius_click_to_pay_data'] ), true ) : array();
+            if ( empty( $ctp_data['encPaymentData'] ) || empty( $ctp_data['callId'] ) ) {
+                throw new Exception( __( 'Payment error: Missing Click to Pay data.', 'therius-woocommerce' ) );
+            }
+            $body['clickToPayData'] = array(
+                'encPaymentData' => $ctp_data['encPaymentData'],
+                'callId'         => $ctp_data['callId'],
+            );
+        } elseif ( 'apm' === $therius_method ) {
+            $apm_data = isset( $_POST['therius_apm_data'] ) ? json_decode( wp_unslash( $_POST['therius_apm_data'] ), true ) : array();
+            if ( empty( $apm_data ) ) {
+                throw new Exception( __( 'Payment error: Missing APM data.', 'therius-woocommerce' ) );
+            }
+            if ( empty( $apm_data['payerName'] ) ) {
+                $apm_data['payerName'] = trim( $ctx['first_name'] . ' ' . $ctx['last_name'] );
+            }
+            if ( empty( $apm_data['payerEmail'] ) ) {
+                $apm_data['payerEmail'] = $ctx['email'];
+            }
+            $apm_data['billingAddress'] = array(
+                'address1'    => $ctx['address1'],
+                'address2'    => $ctx['address2'],
+                'city'        => $ctx['city'],
+                'state'       => $ctx['state'],
+                'countryCode' => $ctx['country'],
+                'postalCode'  => $ctx['postcode'],
+            );
+            $body['apm'] = $apm_data;
+        } elseif ( 'wallet' === $therius_method ) {
+            $wallet_data = isset( $_POST['therius_wallet_data'] ) ? json_decode( wp_unslash( $_POST['therius_wallet_data'] ), true ) : array();
+            if ( empty( $wallet_data ) ) {
+                throw new Exception( __( 'Payment error: Missing Wallet data.', 'therius-woocommerce' ) );
+            }
+            $body['wallet'] = $wallet_data;
+        } else {
+            throw new Exception( __( 'Payment error: Unknown payment method.', 'therius-woocommerce' ) );
+        }
+
+        return $body;
     }
 
     /**
@@ -323,6 +507,18 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
     public function process_payment( $order_id ) {
         $order = wc_get_order( $order_id );
 
+        // Checkout Blocks path: a pre-order AJAX attempt (see
+        // class-wc-therius-blocks-support.php / assets/js/therius-checkout-blocks.js)
+        // already drove the purchase to a final, server-verified outcome
+        // before this order even existed — Blocks bridges the paymentMethodData
+        // our onPaymentSetup handler returned into $_POST for exactly this kind
+        // of legacy process_payment() compatibility. Apply the stashed result
+        // instead of charging again.
+        $blocks_attempt_id = isset( $_POST['therius_blocks_attempt_id'] ) ? wc_clean( $_POST['therius_blocks_attempt_id'] ) : '';
+        if ( ! empty( $blocks_attempt_id ) ) {
+            return $this->apply_blocks_stashed_result( $order, $blocks_attempt_id );
+        }
+
         $therius_method = isset( $_POST['therius_method'] ) ? wc_clean( $_POST['therius_method'] ) : 'card';
 
         // The widget resolved this payment's final outcome itself, client-side
@@ -346,119 +542,17 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             $shopper_override = array();
         }
 
-        $body = array(
-            'amount'    => array(
-                'value'    => $this->to_minor_units( $order->get_total(), $order->get_currency() ),
-                'currency' => $order->get_currency(),
-                'exponent' => $this->currency_exponent( $order->get_currency() ),
-            ),
-            'shopper'   => array(
-                'email' => ! empty( $shopper_override['email'] ) ? sanitize_email( $shopper_override['email'] ) : $order->get_billing_email(),
-                'name'  => ! empty( $shopper_override['name'] ) ? sanitize_text_field( $shopper_override['name'] ) : $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
-            ),
-            // This PHP request IS the customer's own checkout-page form
-            // submission (see therius-checkout.js's triggerWooCommerceSubmit,
-            // which injects the SDK's collected data into the WooCommerce
-            // checkout form and submits it normally) — so $_SERVER here still
-            // carries the real shopper browser's headers/IP, not WordPress's
-            // own. Required for 3DS (therius-3ds's browser_info fields) and,
-            // more strictly, for Stripe ACH's mandate_data.customer_acceptance:
-            // Stripe hard-rejects an empty user_agent rather than silently
-            // accepting it (handlers_payment.go only sets gwReq.UserAgent when
-            // browserInfo is present at all — omitting this block entirely
-            // left every WooCommerce-originated ACH purchase failing with
-            // "You passed an empty string for
-            // 'mandate_data[customer_acceptance][online][user_agent]'").
-            'browserInfo' => array(
-                'userAgent' => isset( $_SERVER['HTTP_USER_AGENT'] ) ? wc_clean( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : '',
-                'ipAddress' => $order->get_customer_ip_address(),
-            ),
-        );
+        $ctx  = $this->context_from_order( $order );
+        $body = $this->build_purchase_body( $ctx, $therius_method, $shopper_override );
 
-        $customer_id = $order->get_customer_id();
-        if ( ! empty( $customer_id ) ) {
-            $body['shopper']['id'] = strval( $customer_id );
-        }
-
+        // build_purchase_body() only sets tokenize=true when vault_consent is
+        // present AND a shopper id is known; log the guest-checkout edge case
+        // here since only process_payment() has a real $order to note it on.
         if ( 'card' === $therius_method ) {
-            $nonce = isset( $_POST['therius_nonce'] ) ? wc_clean( $_POST['therius_nonce'] ) : '';
-            if ( empty( $nonce ) ) {
-                throw new Exception( __( 'Payment error: Missing Therius payment nonce.', 'therius-woocommerce' ) );
-            }
-            $body['card'] = array(
-                'nonceData' => array(
-                    'nonce' => $nonce,
-                    'cardholderName' => ! empty( $shopper_override['name'] ) ? sanitize_text_field( $shopper_override['name'] ) : $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
-                    'cardAddress' => $this->build_card_address( $order, $shopper_override ),
-                )
-            );
-
-            // The widget's own "save my card" checkbox state — see the onNonce
-            // comment in therius-checkout.js for why this arrives as a separate
-            // hidden field rather than something read off the order. The API
-            // requires shopper.id whenever tokenize is true (400s otherwise);
-            // the widget itself only renders the checkbox for an identified
-            // shopper (session-bound customerId, i.e. a logged-in user — see
-            // $customer_id above), so in practice this should never fire for a
-            // guest checkout, but skip tokenizing rather than let the whole
-            // payment fail if it somehow does.
             $vault_consent = isset( $_POST['therius_vault_consent'] ) && '1' === wc_clean( $_POST['therius_vault_consent'] );
-            if ( $vault_consent && ! empty( $body['shopper']['id'] ) ) {
-                $body['card']['nonceData']['tokenize'] = true;
-            } elseif ( $vault_consent ) {
+            if ( $vault_consent && empty( $ctx['customer_id'] ) ) {
                 $order->add_order_note( __( 'Therius: shopper requested to save this card, but no shopper id was available (guest checkout) — card was not saved.', 'therius-woocommerce' ) );
             }
-        } elseif ( 'saved_method' === $therius_method ) {
-            $token = isset( $_POST['therius_saved_token'] ) ? wc_clean( $_POST['therius_saved_token'] ) : '';
-            if ( empty( $token ) ) {
-                throw new Exception( __( 'Payment error: Missing saved card token.', 'therius-woocommerce' ) );
-            }
-            // Same endpoint (/payment/purchase) as a fresh card — card.tokenData.token
-            // is the "reuse a vaulted card" path (resolveCard in handlers_payment.go),
-            // parallel to card.nonceData for a new card.
-            $body['card'] = array(
-                'tokenData' => array(
-                    'token'       => $token,
-                    'cardAddress' => $this->build_card_address( $order, $shopper_override ),
-                ),
-            );
-        } elseif ( 'click_to_pay' === $therius_method ) {
-            $ctp_data = isset( $_POST['therius_click_to_pay_data'] ) ? json_decode( wp_unslash( $_POST['therius_click_to_pay_data'] ), true ) : array();
-            if ( empty( $ctp_data['encPaymentData'] ) || empty( $ctp_data['callId'] ) ) {
-                throw new Exception( __( 'Payment error: Missing Click to Pay data.', 'therius-woocommerce' ) );
-            }
-            $body['clickToPayData'] = array(
-                'encPaymentData' => $ctp_data['encPaymentData'],
-                'callId'         => $ctp_data['callId'],
-            );
-        } elseif ( 'apm' === $therius_method ) {
-            $apm_data = isset( $_POST['therius_apm_data'] ) ? json_decode( wp_unslash( $_POST['therius_apm_data'] ), true ) : array();
-            if ( empty( $apm_data ) ) {
-                throw new Exception( __( 'Payment error: Missing APM data.', 'therius-woocommerce' ) );
-            }
-            if ( empty( $apm_data['payerName'] ) ) {
-                $apm_data['payerName'] = $order->get_billing_first_name() . ' ' . $order->get_billing_last_name();
-            }
-            if ( empty( $apm_data['payerEmail'] ) ) {
-                $apm_data['payerEmail'] = $order->get_billing_email();
-            }
-            $apm_data['billingAddress'] = array(
-                'address1'    => $order->get_billing_address_1(),
-                'address2'    => $order->get_billing_address_2(),
-                'city'        => $order->get_billing_city(),
-                'state'       => $order->get_billing_state(),
-                'countryCode' => $order->get_billing_country(),
-                'postalCode'  => $order->get_billing_postcode(),
-            );
-            $body['apm'] = $apm_data;
-        } elseif ( 'wallet' === $therius_method ) {
-            $wallet_data = isset( $_POST['therius_wallet_data'] ) ? json_decode( wp_unslash( $_POST['therius_wallet_data'] ), true ) : array();
-            if ( empty( $wallet_data ) ) {
-                throw new Exception( __( 'Payment error: Missing Wallet data.', 'therius-woocommerce' ) );
-            }
-            $body['wallet'] = $wallet_data;
-        } else {
-            throw new Exception( __( 'Payment error: Unknown payment method.', 'therius-woocommerce' ) );
         }
 
         // Determine API URL based on environment
@@ -706,6 +800,235 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
     }
 
     /**
+     * A client-minted opaque token identifying one Checkout Blocks purchase
+     * attempt (assets/js/therius-checkout-blocks.js generates it fresh per
+     * onPaymentSetup cycle). Used as both a transient-key suffix and the
+     * `wcbx_<id>` orderCode sent to Therius — validated everywhere it's read
+     * from a request so it can't be used to probe/collide transient keys.
+     */
+    private function is_valid_blocks_attempt_id( $attempt_id ) {
+        return is_string( $attempt_id ) && preg_match( '/^[A-Za-z0-9_-]{8,64}$/', $attempt_id );
+    }
+
+    /**
+     * Checkout Blocks pre-order AJAX handler — see the architecture comment
+     * on process_payment()'s therius_blocks_attempt_id branch and
+     * class-wc-therius-blocks-support.php. Called (possibly more than once
+     * per checkout attempt — once per DDC retry) by
+     * therius-checkout-blocks.js's onNonce/onApm/onWalletToken/
+     * onSavedMethodSelected/onClickToPay interceptors, BEFORE any WC_Order
+     * exists. Builds the purchase body from the current cart/customer
+     * (never trusts a client-supplied amount), calls the real purchase API,
+     * and either hands an actionRequired action back to the widget (still
+     * not final) or stashes the final, server-verified outcome in a
+     * transient for process_payment() to pick up once Blocks creates the
+     * real order.
+     */
+    public function ajax_blocks_attempt() {
+        check_ajax_referer( 'therius_blocks', 'nonce' );
+
+        $attempt_id = isset( $_POST['attempt_id'] ) ? wc_clean( $_POST['attempt_id'] ) : '';
+        if ( ! $this->is_valid_blocks_attempt_id( $attempt_id ) ) {
+            wp_send_json_error( array( 'message' => __( 'Invalid payment attempt.', 'therius-woocommerce' ) ) );
+        }
+
+        $therius_method    = isset( $_POST['therius_method'] ) ? wc_clean( $_POST['therius_method'] ) : 'card';
+        $shopper_override  = isset( $_POST['therius_shopper_override'] ) ? json_decode( wp_unslash( $_POST['therius_shopper_override'] ), true ) : array();
+        if ( ! is_array( $shopper_override ) ) {
+            $shopper_override = array();
+        }
+
+        $order_code = 'wcbx_' . $attempt_id;
+        $ctx        = $this->context_from_cart();
+
+        try {
+            $body = $this->build_purchase_body( $ctx, $therius_method, $shopper_override );
+        } catch ( Exception $e ) {
+            wp_send_json_error( array( 'message' => $e->getMessage() ) );
+        }
+
+        $api_url     = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
+        $body['key'] = $this->private_key;
+        if ( ! empty( $this->merchant_code ) ) {
+            $body['merchantCode'] = $this->merchant_code;
+        }
+
+        $payment_code = isset( $_POST['therius_payment_code'] ) ? wc_clean( $_POST['therius_payment_code'] ) : '';
+        if ( ! empty( $payment_code ) ) {
+            $body['threeDsSetup'] = array( 'sessionId' => $payment_code );
+        }
+
+        $payload_hash        = md5( wp_json_encode( $body ) );
+        $body['orderCode']   = $order_code;
+        $body['paymentCode'] = $order_code . '_' . substr( $payload_hash, 0, 8 );
+
+        $idempotency_key = 'wcbx_purchase_' . $attempt_id . '_' . $payload_hash;
+
+        $response = wp_remote_post( $api_url . '/v1/payment/purchase', array(
+            'method'    => 'POST',
+            'headers'   => array(
+                'Authorization'   => 'Bearer ' . $this->private_key,
+                'Content-Type'    => 'application/json',
+                'Idempotency-Key' => $idempotency_key,
+            ),
+            'body'      => wp_json_encode( $body ),
+            'timeout'   => 45,
+        ) );
+
+        if ( is_wp_error( $response ) ) {
+            wp_send_json_error( array( 'message' => __( 'Connection error with Therius API.', 'therius-woocommerce' ) ) );
+        }
+
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+
+        // Same actionRequired-presence gate as process_payment() — see the
+        // comment there on why this must not be narrowed to the two named
+        // 3DS statuses (an ACH microdeposit action carries a generic
+        // 'pending' status alongside actionRequired).
+        if ( ! empty( $data['actionRequired'] ) ) {
+            wp_send_json_success( array( 'actionRequired' => $data['actionRequired'] ) );
+        }
+
+        $accepted_statuses = array( 'captured', 'authorized', 'pending', 'approved', 'succeeded' );
+        if ( wp_remote_retrieve_response_code( $response ) >= 400 || ! isset( $data['paymentCode'] ) || ! in_array( $data['status'], $accepted_statuses, true ) ) {
+            wp_send_json_error( array( 'message' => $this->extract_error_message( $data ) ) );
+        }
+
+        set_transient(
+            'therius_blocks_attempt_' . $attempt_id,
+            array(
+                'order_code'   => $order_code,
+                'payment_code' => $data['paymentCode'],
+                'status'       => $data['status'],
+            ),
+            15 * MINUTE_IN_SECONDS
+        );
+
+        wp_send_json_success( array( 'final' => true ) );
+    }
+
+    /**
+     * Checkout Blocks finalize AJAX handler — the counterpart to
+     * finalize_from_action_complete() for the pre-order flow. Called by
+     * therius-checkout-blocks.js's onActionComplete once the widget itself
+     * has resolved a real 3DS *challenge* via a direct client-to-Therius
+     * call (bypassing our server) — this is the first WE see of that
+     * outcome, so it's re-derived via GET /payment/inquiry rather than
+     * trusted from the client, exactly like finalize_from_action_complete().
+     */
+    public function ajax_blocks_finalize() {
+        check_ajax_referer( 'therius_blocks', 'nonce' );
+
+        $attempt_id     = isset( $_POST['attempt_id'] ) ? wc_clean( $_POST['attempt_id'] ) : '';
+        $submitted_code = isset( $_POST['therius_finalize_payment_code'] ) ? wc_clean( $_POST['therius_finalize_payment_code'] ) : '';
+        if ( ! $this->is_valid_blocks_attempt_id( $attempt_id ) || empty( $submitted_code ) ) {
+            wp_send_json_error( array( 'message' => __( 'Payment error: could not verify payment outcome.', 'therius-woocommerce' ) ) );
+        }
+
+        $expected_order_code = 'wcbx_' . $attempt_id;
+        $api_url              = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
+        $headers              = array( 'Authorization' => 'Bearer ' . $this->private_key );
+        if ( $this->testmode ) {
+            $headers['X-Environment'] = 'sandbox';
+        }
+
+        // Same read-after-write retry as finalize_from_action_complete() —
+        // see the comment there.
+        $max_attempts = 3;
+        $data         = null;
+        $response     = null;
+        for ( $attempt = 1; $attempt <= $max_attempts; $attempt++ ) {
+            $response = wp_remote_get( $api_url . '/v1/payment/inquiry/' . rawurlencode( $submitted_code ), array(
+                'headers' => $headers,
+                'timeout' => 45,
+            ) );
+
+            if ( is_wp_error( $response ) ) {
+                wp_send_json_error( array( 'message' => __( 'Connection error with Therius API.', 'therius-woocommerce' ) ) );
+            }
+
+            $data = json_decode( wp_remote_retrieve_body( $response ), true );
+
+            if ( wp_remote_retrieve_response_code( $response ) < 400 && ! empty( $data['status'] ) ) {
+                break;
+            }
+
+            if ( $attempt < $max_attempts ) {
+                usleep( 700000 ); // 0.7s
+            }
+        }
+
+        if ( wp_remote_retrieve_response_code( $response ) >= 400 || empty( $data['status'] ) ) {
+            wp_send_json_error( array( 'message' => $this->extract_error_message( $data ) ) );
+        }
+
+        if ( empty( $data['orderCode'] ) || $data['orderCode'] !== $expected_order_code ) {
+            wp_send_json_error( array( 'message' => __( 'Payment error: could not verify payment outcome.', 'therius-woocommerce' ) ) );
+        }
+
+        $accepted_statuses = array( 'captured', 'authorized', 'pending', 'approved', 'succeeded' );
+        if ( ! in_array( $data['status'], $accepted_statuses, true ) ) {
+            wp_send_json_error( array( 'message' => $this->extract_error_message( $data ) ) );
+        }
+
+        set_transient(
+            'therius_blocks_attempt_' . $attempt_id,
+            array(
+                'order_code'   => $expected_order_code,
+                'payment_code' => $data['paymentCode'],
+                'status'       => $data['status'],
+            ),
+            15 * MINUTE_IN_SECONDS
+        );
+
+        wp_send_json_success( array( 'final' => true ) );
+    }
+
+    /**
+     * Applies a Checkout Blocks pre-order attempt's already-verified stashed
+     * outcome (ajax_blocks_attempt()/ajax_blocks_finalize()) to the real
+     * order Blocks just created — called from process_payment() once that
+     * order exists. No purchase API call happens here; the charge already
+     * happened (or was verified) before this order ever existed.
+     */
+    private function apply_blocks_stashed_result( $order, $attempt_id ) {
+        if ( ! $this->is_valid_blocks_attempt_id( $attempt_id ) ) {
+            throw new Exception( __( 'Payment error: could not verify payment outcome.', 'therius-woocommerce' ) );
+        }
+
+        $transient_key = 'therius_blocks_attempt_' . $attempt_id;
+        $stash         = get_transient( $transient_key );
+        if ( empty( $stash ) || empty( $stash['status'] ) || empty( $stash['payment_code'] ) || empty( $stash['order_code'] ) ) {
+            throw new Exception( __( 'Payment error: could not verify payment outcome.', 'therius-woocommerce' ) );
+        }
+
+        $order->update_meta_data( '_therius_order_code', $stash['order_code'] );
+        $order->update_meta_data( '_therius_payment_code', $stash['payment_code'] );
+        $order->save();
+
+        if ( 'captured' === $stash['status'] ) {
+            $order->payment_complete( $stash['payment_code'] );
+            $order->add_order_note( sprintf( __( 'Therius payment captured (Transaction: %s).', 'therius-woocommerce' ), $stash['payment_code'] ) );
+        } elseif ( 'pending' === $stash['status'] ) {
+            $order->update_status( 'on-hold', __( 'Therius: payment pending review, awaiting outcome via webhook.', 'therius-woocommerce' ) );
+        } else {
+            $order->update_status( 'on-hold', __( 'Therius: payment authorized, awaiting capture confirmation.', 'therius-woocommerce' ) );
+        }
+        WC()->cart->empty_cart();
+
+        // Only delete once fully applied — if something above threw, the
+        // stash survives so a WooCommerce retry of process_payment() (e.g.
+        // after a transient save() failure) can still succeed instead of
+        // failing with a now-missing stash.
+        delete_transient( $transient_key );
+
+        return array(
+            'result'   => 'success',
+            'redirect' => $this->get_return_url( $order ),
+        );
+    }
+
+    /**
      * Process a refund initiated from the WooCommerce admin (Orders → Refund).
      *
      * @param int    $order_id
@@ -949,74 +1272,103 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
     }
 
     /**
+     * Creates an SDK session and returns its clientToken (or '' on failure).
+     * Shared by the classic payment_scripts() enqueue and the Checkout
+     * Blocks get_blocks_payment_method_data() — same call, same params,
+     * previously duplicated between the two.
+     */
+    private function fetch_client_token() {
+        $api_url = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
+
+        $session_body = array(
+            'country'  => WC()->customer && WC()->customer->get_billing_country() ? WC()->customer->get_billing_country() : WC()->countries->get_base_country(),
+            'currency' => get_woocommerce_currency(),
+        );
+
+        if ( is_user_logged_in() ) {
+            $session_body['customerId'] = strval( get_current_user_id() );
+        }
+
+        if ( ! empty( $this->checkout_config_id ) ) {
+            $session_body['checkoutConfigId'] = $this->checkout_config_id;
+        }
+
+        $response = wp_remote_post( $api_url . '/v1/sdk/session', array(
+            'method'  => 'POST',
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $this->private_key,
+                'Content-Type'  => 'application/json',
+            ),
+            'body'    => wp_json_encode( $session_body ),
+        ) );
+
+        if ( is_wp_error( $response ) ) {
+            return '';
+        }
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+        return isset( $data['clientToken'] ) ? $data['clientToken'] : '';
+    }
+
+    /**
+     * The data localized to both the classic (`therius_params`) and Checkout
+     * Blocks (`therius_data`, via get_blocks_payment_method_data()) frontend
+     * scripts — same shape, same source, so the two checkouts can never drift
+     * apart on amount/currency/country/checkout_config_id.
+     */
+    private function build_localized_params( $client_token ) {
+        $api_url = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
+
+        $params = array(
+            'client_token'       => $client_token,
+            'base_url'           => $api_url,
+            'currency'           => get_woocommerce_currency(),
+            'amount'             => WC()->cart ? $this->to_minor_units( WC()->cart->total, get_woocommerce_currency() ) : 0,
+            'country'            => WC()->customer && WC()->customer->get_billing_country() ? WC()->customer->get_billing_country() : WC()->countries->get_base_country(),
+            'checkout_config_id' => $this->checkout_config_id,
+        );
+
+        if ( ! empty( $this->merchant_code ) ) {
+            $params['merchantCode'] = $this->merchant_code;
+        }
+
+        return $params;
+    }
+
+    /**
+     * Data passed to the Checkout Blocks integration script — see
+     * class-wc-therius-blocks-support.php::get_payment_method_data().
+     * Adds the AJAX endpoint + nonce the block's onPaymentSetup needs to
+     * drive ajax_blocks_attempt()/ajax_blocks_finalize() on top of the same
+     * params the classic flow gets.
+     */
+    public function get_blocks_payment_method_data() {
+        $params            = $this->build_localized_params( $this->fetch_client_token() );
+        $params['ajaxUrl'] = admin_url( 'admin-ajax.php' );
+        $params['nonce']   = wp_create_nonce( 'therius_blocks' );
+        $params['title']   = $this->title;
+        return $params;
+    }
+
+    /**
      * Load custom scripts
      */
     public function payment_scripts() {
         if ( ! is_cart() && ! is_checkout() && ! isset( $_GET['pay_for_order'] ) ) {
             return;
         }
-        
+
         if ( 'no' === $this->enabled ) {
             return;
         }
 
         $api_url = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
 
-        $session_body = array(
-            'country'  => WC()->customer && WC()->customer->get_billing_country() ? WC()->customer->get_billing_country() : WC()->countries->get_base_country(),
-            'currency' => get_woocommerce_currency()
-        );
-
-        if ( is_user_logged_in() ) {
-            $session_body['customerId'] = strval( get_current_user_id() );
-        }
-        
-        if ( ! empty( $this->checkout_config_id ) ) {
-            $session_body['checkoutConfigId'] = $this->checkout_config_id;
-        }
-
-        // Get a clientToken from Therius API for the frontend SDK
-        $response = wp_remote_post( $api_url . '/v1/sdk/session', array(
-            'method'    => 'POST',
-            'headers'   => array(
-                'Authorization' => 'Bearer ' . $this->private_key,
-                'Content-Type'  => 'application/json',
-            ),
-            'body'      => wp_json_encode( $session_body ),
-        ) );
-
-        $client_token = '';
-        if ( ! is_wp_error( $response ) ) {
-            $body = wp_remote_retrieve_body( $response );
-            $data = json_decode( $body, true );
-            if ( isset( $data['clientToken'] ) ) {
-                $client_token = $data['clientToken'];
-            }
-        }
-
         // Enqueue Therius frontend SDK (served by the API itself, no separate js.* host)
         wp_enqueue_script( 'therius-sdk', $api_url . '/v1/sdk/js', array(), '1.0.0', true );
-        
+
         // Enqueue our custom integration script
         wp_enqueue_script( 'woocommerce_therius', plugins_url( 'assets/js/therius-checkout.js', dirname( __FILE__ ) ), array( 'therius-sdk', 'jquery' ), '1.0.0', true );
 
-        // Get the configured checkout config ID based on environment
-        $checkout_config_id = $this->checkout_config_id;
-
-        // Pass PHP variables to JS
-        $therius_params = array(
-            'client_token'       => $client_token,
-            'base_url'           => $api_url,
-            'currency'           => get_woocommerce_currency(),
-            'amount'             => WC()->cart ? $this->to_minor_units( WC()->cart->total, get_woocommerce_currency() ) : 0,
-            'country'            => WC()->customer && WC()->customer->get_billing_country() ? WC()->customer->get_billing_country() : WC()->countries->get_base_country(),
-            'checkout_config_id' => $checkout_config_id
-        );
-
-        if ( ! empty( $this->merchant_code ) ) {
-            $therius_params['merchantCode'] = $this->merchant_code;
-        }
-
-        wp_localize_script( 'woocommerce_therius', 'therius_params', $therius_params );
+        wp_localize_script( 'woocommerce_therius', 'therius_params', $this->build_localized_params( $this->fetch_client_token() ) );
     }
 }
