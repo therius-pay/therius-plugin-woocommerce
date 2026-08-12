@@ -282,6 +282,23 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
     }
 
     /**
+     * Build a card.nonceData/tokenData.cardAddress payload from the order's
+     * stored billing address, with the widget-collected shopper override
+     * (CollectedShopperInfo, see onNonce/onSavedMethodSelected in
+     * therius-checkout.js) applied field-by-field where present/non-empty.
+     */
+    private function build_card_address( $order, $shopper_override ) {
+        return array(
+            'address1'    => ! empty( $shopper_override['address1'] ) ? sanitize_text_field( $shopper_override['address1'] ) : $order->get_billing_address_1(),
+            'address2'    => $order->get_billing_address_2(),
+            'city'        => ! empty( $shopper_override['city'] ) ? sanitize_text_field( $shopper_override['city'] ) : $order->get_billing_city(),
+            'state'       => ! empty( $shopper_override['state'] ) ? sanitize_text_field( $shopper_override['state'] ) : $order->get_billing_state(),
+            'countryCode' => ! empty( $shopper_override['country'] ) ? sanitize_text_field( $shopper_override['country'] ) : $order->get_billing_country(),
+            'postalCode'  => ! empty( $shopper_override['postalCode'] ) ? sanitize_text_field( $shopper_override['postalCode'] ) : $order->get_billing_postcode(),
+        );
+    }
+
+    /**
      * Extract a human-readable message from a Therius API response.
      * HTTP-level errors return a flat string (`{"error": "..."}`); a genuine
      * decline is a 200 OK with `status: "refused"` and the reason under
@@ -318,6 +335,17 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             return $this->finalize_from_action_complete( $order );
         }
 
+        // Widget-collected shopper info (CollectedShopperInfo), sent only when
+        // the "save my card" checkbox is checked and the shopper filled in the
+        // widget's own optional email/address fields — see onNonce/
+        // onSavedMethodSelected in therius-checkout.js. It's an override for
+        // THIS charge, not a replacement for the order's stored data, so every
+        // field is applied only when present/non-empty.
+        $shopper_override = isset( $_POST['therius_shopper_override'] ) ? json_decode( wp_unslash( $_POST['therius_shopper_override'] ), true ) : array();
+        if ( ! is_array( $shopper_override ) ) {
+            $shopper_override = array();
+        }
+
         $body = array(
             'amount'    => array(
                 'value'    => $this->to_minor_units( $order->get_total(), $order->get_currency() ),
@@ -325,8 +353,8 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
                 'exponent' => $this->currency_exponent( $order->get_currency() ),
             ),
             'shopper'   => array(
-                'email' => $order->get_billing_email(),
-                'name'  => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
+                'email' => ! empty( $shopper_override['email'] ) ? sanitize_email( $shopper_override['email'] ) : $order->get_billing_email(),
+                'name'  => ! empty( $shopper_override['name'] ) ? sanitize_text_field( $shopper_override['name'] ) : $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
             ),
             // This PHP request IS the customer's own checkout-page form
             // submission (see therius-checkout.js's triggerWooCommerceSubmit,
@@ -360,15 +388,8 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             $body['card'] = array(
                 'nonceData' => array(
                     'nonce' => $nonce,
-                    'cardholderName' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
-                    'cardAddress' => array(
-                        'address1'    => $order->get_billing_address_1(),
-                        'address2'    => $order->get_billing_address_2(),
-                        'city'        => $order->get_billing_city(),
-                        'state'       => $order->get_billing_state(),
-                        'countryCode' => $order->get_billing_country(),
-                        'postalCode'  => $order->get_billing_postcode(),
-                    )
+                    'cardholderName' => ! empty( $shopper_override['name'] ) ? sanitize_text_field( $shopper_override['name'] ) : $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
+                    'cardAddress' => $this->build_card_address( $order, $shopper_override ),
                 )
             );
 
@@ -398,15 +419,17 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             $body['card'] = array(
                 'tokenData' => array(
                     'token'       => $token,
-                    'cardAddress' => array(
-                        'address1'    => $order->get_billing_address_1(),
-                        'address2'    => $order->get_billing_address_2(),
-                        'city'        => $order->get_billing_city(),
-                        'state'       => $order->get_billing_state(),
-                        'countryCode' => $order->get_billing_country(),
-                        'postalCode'  => $order->get_billing_postcode(),
-                    ),
+                    'cardAddress' => $this->build_card_address( $order, $shopper_override ),
                 ),
+            );
+        } elseif ( 'click_to_pay' === $therius_method ) {
+            $ctp_data = isset( $_POST['therius_click_to_pay_data'] ) ? json_decode( wp_unslash( $_POST['therius_click_to_pay_data'] ), true ) : array();
+            if ( empty( $ctp_data['encPaymentData'] ) || empty( $ctp_data['callId'] ) ) {
+                throw new Exception( __( 'Payment error: Missing Click to Pay data.', 'therius-woocommerce' ) );
+            }
+            $body['clickToPayData'] = array(
+                'encPaymentData' => $ctp_data['encPaymentData'],
+                'callId'         => $ctp_data['callId'],
             );
         } elseif ( 'apm' === $therius_method ) {
             $apm_data = isset( $_POST['therius_apm_data'] ) ? json_decode( wp_unslash( $_POST['therius_apm_data'] ), true ) : array();

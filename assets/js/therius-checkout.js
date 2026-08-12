@@ -123,18 +123,35 @@ jQuery( function( $ ) {
                 // reflects the widget's own "save my card" checkbox and must be
                 // forwarded through to PHP, which is what actually sets
                 // card.nonceData.tokenize on the purchase request.
-                onNonce: function( nonce, ddcSessionId, vaultConsent ) {
-                    return self.triggerWooCommerceSubmit( 'card', { nonce: nonce, vaultConsent: vaultConsent }, ddcSessionId );
+                // `shopper` (4th arg) carries the widget's own optional
+                // email/address fields, collected only when the "save my
+                // card" checkbox is checked — forwarded as a billing-address
+                // override so it isn't silently dropped in favor of the
+                // order's stored address.
+                onNonce: function( nonce, ddcSessionId, vaultConsent, shopper ) {
+                    return self.triggerWooCommerceSubmit( 'card', { nonce: nonce, vaultConsent: vaultConsent, shopper: shopper }, ddcSessionId );
                 },
-                
+
                 // Intercept APM submissions (e.g. Pix, iDEAL)
-                onApm: function( apmData, paymentCode ) {
-                    return self.triggerWooCommerceSubmit( 'apm', apmData, paymentCode );
+                onApm: function( apmData, ddcSessionId ) {
+                    return self.triggerWooCommerceSubmit( 'apm', apmData, ddcSessionId );
                 },
-                
+
                 // Intercept Wallet submissions (Apple Pay / Google Pay)
-                onWalletToken: function( walletData, paymentCode ) {
-                    return self.triggerWooCommerceSubmit( 'wallet', walletData, paymentCode );
+                onWalletToken: function( walletData, ddcSessionId ) {
+                    return self.triggerWooCommerceSubmit( 'wallet', walletData, ddcSessionId );
+                },
+
+                // Intercept Visa Click to Pay submissions. Unlike onNonce/
+                // onApm/onWalletToken, the SDK has NO internal fallback for
+                // this one (see createClickToPayButton in
+                // therius-sdk/src/click_to_pay.ts) — leaving it unset means
+                // a shopper who completes Click to Pay gets total silence:
+                // no purchase call, no error, no order. Forward the Visa
+                // DCF payload as `clickToPayData` on the purchase request,
+                // same as any other payment method here.
+                onClickToPay: function( data ) {
+                    return self.triggerWooCommerceSubmit( 'click_to_pay', data );
                 },
 
                 // Intercept a shopper picking one of their previously-saved
@@ -147,8 +164,12 @@ jQuery( function( $ ) {
                 // _orderCode()) since it has no way to know WooCommerce's
                 // real order number, and the charge never goes through
                 // process_payment() at all.
-                onSavedMethodSelected: function( token, ddcSessionId ) {
-                    return self.triggerWooCommerceSubmit( 'saved_method', { token: token }, ddcSessionId );
+                // `shopper` (3rd arg) is the same widget-collected
+                // address-override echo as onNonce's — forward it so it
+                // isn't silently dropped in favor of the order's stored
+                // address.
+                onSavedMethodSelected: function( token, ddcSessionId, shopper ) {
+                    return self.triggerWooCommerceSubmit( 'saved_method', { token: token, shopper: shopper }, ddcSessionId );
                 },
 
                 // Fires when the widget itself finished resolving a payment
@@ -187,37 +208,50 @@ jQuery( function( $ ) {
             this.toggleNativeButton();
         },
 
-        triggerWooCommerceSubmit: function( methodType, payload, paymentCode ) {
+        // `ddcSessionId` is only set when the SDK is re-invoking the interceptor
+        // after a pending_ddc device-data-collection round completed. It rides
+        // in the `therius_payment_code` hidden field (name kept as-is — PHP's
+        // process_payment() reads it into threeDsSetup.sessionId) purely
+        // because that field already existed; it does NOT carry a paymentCode.
+        triggerWooCommerceSubmit: function( methodType, payload, ddcSessionId ) {
             var self = this;
             // We return a Promise to the Widget. The widget will show a loading spinner
             // until this Promise resolves or rejects.
             return new Promise( function( resolve, reject ) {
                 self.currentResolve = resolve;
                 self.currentReject = reject;
-                
+
                 var $form = $( 'form.checkout, form#order_review' );
-                
+
                 // Remove any old injected data
                 $form.find( '.therius_injected_data' ).remove();
-                
+
                 // Inject method type
                 $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_method' }).val(methodType).appendTo($form);
-                
-                if ( paymentCode ) {
-                    $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_payment_code' }).val(paymentCode).appendTo($form);
+
+                if ( ddcSessionId ) {
+                    $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_payment_code' }).val(ddcSessionId).appendTo($form);
                 }
-                
+
                 if ( methodType === 'card' ) {
                     $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_nonce' }).val(payload.nonce).appendTo($form);
                     if ( payload.vaultConsent ) {
                         $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_vault_consent' }).val('1').appendTo($form);
                     }
+                    if ( payload.shopper ) {
+                        $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_shopper_override' }).val(JSON.stringify(payload.shopper)).appendTo($form);
+                    }
                 } else if ( methodType === 'apm' ) {
                     $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_apm_data' }).val(JSON.stringify(payload)).appendTo($form);
                 } else if ( methodType === 'wallet' ) {
                     $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_wallet_data' }).val(JSON.stringify(payload)).appendTo($form);
+                } else if ( methodType === 'click_to_pay' ) {
+                    $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_click_to_pay_data' }).val(JSON.stringify(payload)).appendTo($form);
                 } else if ( methodType === 'saved_method' ) {
                     $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_saved_token' }).val(payload.token).appendTo($form);
+                    if ( payload.shopper ) {
+                        $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_shopper_override' }).val(JSON.stringify(payload.shopper)).appendTo($form);
+                    }
                 }
 
                 // Programmatically trigger standard WooCommerce validation and submission
