@@ -36,7 +36,17 @@
             .then( function( res ) { return res.json(); } )
             .then( function( json ) {
                 if ( ! json || ! json.success ) {
-                    var message = ( json && json.data && json.data.message ) || 'Payment failed. Please try again.';
+                    var data          = ( json && json.data ) || {};
+                    var message       = data.message || 'Payment failed. Please try again.';
+                    var recoveryAction = data.recoveryAction;
+                    // recoveryAction present → construct the SDK's DeclineError so
+                    // CheckoutWidget's built-in smart recovery (retry/switch_method/
+                    // terminal) activates, same as therius-plugin-shopware's
+                    // therius-payment.plugin.js. Falls back to a plain Error
+                    // (generic message, no smart recovery) otherwise.
+                    if ( recoveryAction && window.TheriusSDK && window.TheriusSDK.DeclineError ) {
+                        throw new window.TheriusSDK.DeclineError( message, recoveryAction );
+                    }
                     throw new Error( message );
                 }
                 return json.data || {};

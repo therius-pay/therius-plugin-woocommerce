@@ -499,6 +499,22 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
     }
 
     /**
+     * Companion to extract_error_message() — surfaces refusalCode.recoveryAction
+     * ('retry' | 'switch_method' | 'terminal') so the Checkout Blocks widget's
+     * onNonce/onApm/onWalletToken interceptors can reject with the SDK's
+     * DeclineError instead of a plain Error, letting CheckoutWidget's built-in
+     * smart recovery activate. Defaults to 'switch_method' — the safest
+     * generic fallback (nudge toward another method, don't wipe the widget)
+     * when no explicit recoveryAction was returned by the API.
+     */
+    private function extract_recovery_action( $data ) {
+        if ( isset( $data['refusalCode']['recoveryAction'] ) && is_string( $data['refusalCode']['recoveryAction'] ) ) {
+            return $data['refusalCode']['recoveryAction'];
+        }
+        return 'switch_method';
+    }
+
+    /**
      * Process the payment and return the result
      *
      * @param int $order_id
@@ -891,7 +907,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
 
         $accepted_statuses = array( 'captured', 'authorized', 'pending', 'approved', 'succeeded' );
         if ( wp_remote_retrieve_response_code( $response ) >= 400 || ! isset( $data['paymentCode'] ) || ! in_array( $data['status'], $accepted_statuses, true ) ) {
-            wp_send_json_error( array( 'message' => $this->extract_error_message( $data ) ) );
+            wp_send_json_error( array(
+                'message'        => $this->extract_error_message( $data ),
+                'recoveryAction' => $this->extract_recovery_action( $data ),
+            ) );
         }
 
         set_transient(
@@ -968,7 +987,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
 
         $accepted_statuses = array( 'captured', 'authorized', 'pending', 'approved', 'succeeded' );
         if ( ! in_array( $data['status'], $accepted_statuses, true ) ) {
-            wp_send_json_error( array( 'message' => $this->extract_error_message( $data ) ) );
+            wp_send_json_error( array(
+                'message'        => $this->extract_error_message( $data ),
+                'recoveryAction' => $this->extract_recovery_action( $data ),
+            ) );
         }
 
         set_transient(
