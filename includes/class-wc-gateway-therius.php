@@ -651,6 +651,14 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         // UUID is never exposed to the merchant.
         if ( isset( $data['paymentCode'] ) ) {
             $order->update_meta_data( '_therius_payment_code', $data['paymentCode'] );
+            // The Therius payment id (UUID) is the handle for capture / refund /
+            // cancel — POST /v1/payment/{id}/refund. Store it alongside the
+            // paymentCode (which stays as the webhook match key). Orders paid
+            // before this field existed fall back to resolving the id from the
+            // paymentCode via GET /payment/inquiry — see resolve_payment_id().
+            if ( ! empty( $data['id'] ) ) {
+                $order->update_meta_data( '_therius_payment_id', $data['id'] );
+            }
             $order->save();
         }
 
@@ -789,6 +797,9 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         // same purpose as the synchronous-path save in process_payment()
         // (webhook matching).
         $order->update_meta_data( '_therius_payment_code', $data['paymentCode'] );
+        if ( ! empty( $data['id'] ) ) {
+            $order->update_meta_data( '_therius_payment_id', $data['id'] );
+        }
         $order->save();
 
         // Same acceptance rule as the synchronous purchase response in
@@ -918,6 +929,7 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             array(
                 'order_code'   => $order_code,
                 'payment_code' => $data['paymentCode'],
+                'payment_id'   => isset( $data['id'] ) ? $data['id'] : '',
                 'status'       => $data['status'],
             ),
             15 * MINUTE_IN_SECONDS
@@ -998,6 +1010,7 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             array(
                 'order_code'   => $expected_order_code,
                 'payment_code' => $data['paymentCode'],
+                'payment_id'   => isset( $data['id'] ) ? $data['id'] : '',
                 'status'       => $data['status'],
             ),
             15 * MINUTE_IN_SECONDS
@@ -1026,6 +1039,9 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
 
         $order->update_meta_data( '_therius_order_code', $stash['order_code'] );
         $order->update_meta_data( '_therius_payment_code', $stash['payment_code'] );
+        if ( ! empty( $stash['payment_id'] ) ) {
+            $order->update_meta_data( '_therius_payment_id', $stash['payment_id'] );
+        }
         $order->save();
 
         if ( 'captured' === $stash['status'] ) {
@@ -1048,6 +1064,53 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             'result'   => 'success',
             'redirect' => $this->get_return_url( $order ),
         );
+    }
+
+    /**
+     * Resolve the Therius payment id (UUID) for an order — the handle for the
+     * lifecycle endpoints (POST /v1/payment/{id}/refund|capture|cancel).
+     *
+     * Returns the id stored on the order at purchase time; for an order paid
+     * before that meta existed, resolves it once from the stored paymentCode
+     * via the keyless GET /v1/payment/inquiry/{code} (which also returns the
+     * id) and caches it on the order. Returns '' when it cannot be determined.
+     *
+     * @param WC_Order $order
+     * @return string
+     */
+    private function resolve_payment_id( $order ) {
+        $id = $order->get_meta( '_therius_payment_id' );
+        if ( ! empty( $id ) ) {
+            return $id;
+        }
+
+        $payment_code = $order->get_meta( '_therius_payment_code' );
+        if ( empty( $payment_code ) ) {
+            return '';
+        }
+
+        $api_url = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
+        $headers = array();
+        if ( $this->testmode ) {
+            $headers['X-Environment'] = 'sandbox';
+        }
+
+        $response = wp_remote_get( $api_url . '/v1/payment/inquiry/' . rawurlencode( $payment_code ), array(
+            'headers' => $headers,
+            'timeout' => 30,
+        ) );
+        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) >= 400 ) {
+            return '';
+        }
+
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( empty( $data['id'] ) ) {
+            return '';
+        }
+
+        $order->update_meta_data( '_therius_payment_id', $data['id'] );
+        $order->save();
+        return $data['id'];
     }
 
     /**
@@ -1083,10 +1146,17 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             set_transient( $transient_key, $idempotency_key, 5 * MINUTE_IN_SECONDS );
         }
 
+        // Therius addresses a payment by its server-issued id in the URL —
+        // POST /v1/payment/{id}/refund. orderCode / paymentCode are merchant
+        // reference fields only and are not accepted for this call.
+        $payment_id = $this->resolve_payment_id( $order );
+        if ( empty( $payment_id ) ) {
+            return new WP_Error( 'therius_refund_error', __( 'Could not determine the Therius payment id for this order.', 'therius-woocommerce' ) );
+        }
+
         $body = array(
-            'key'       => $this->private_key,
-            'orderCode' => $order->get_order_number(),
-            'amount'    => array(
+            'key'    => $this->private_key,
+            'amount' => array(
                 'value'    => $this->to_minor_units( $amount, $order->get_currency() ),
                 'currency' => $order->get_currency(),
                 'exponent' => $this->currency_exponent( $order->get_currency() ),
@@ -1094,26 +1164,11 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             'reference' => $reason,
         );
 
-        // Without an explicit paymentCode, therius-public-api's refund lookup
-        // (theriuscore.Lookup, same WHERE order_code=$1 AND payment_code=$2
-        // used by /payment/inquiry) defaults paymentCode to orderCode and
-        // requires an EXACT match on both — but the real payment's
-        // payment_code is the per-attempt hash-suffixed value stored in
-        // _therius_payment_code (set in process_payment() on a synchronous
-        // capture, or finalize_from_action_complete() after a 3DS challenge),
-        // never the bare order number. Omitting this always 400s with "The
-        // payment to be refunded does not exist", regardless of anything else
-        // about the order.
-        $payment_code = $order->get_meta( '_therius_payment_code' );
-        if ( ! empty( $payment_code ) ) {
-            $body['paymentCode'] = $payment_code;
-        }
-
         if ( ! empty( $this->merchant_code ) ) {
             $body['merchantCode'] = $this->merchant_code;
         }
 
-        $response = wp_remote_post( $api_url . '/v1/payment/refund', array(
+        $response = wp_remote_post( $api_url . '/v1/payment/' . rawurlencode( $payment_id ) . '/refund', array(
             'method'  => 'POST',
             'headers' => array(
                 'Authorization'   => 'Bearer ' . $this->private_key,
