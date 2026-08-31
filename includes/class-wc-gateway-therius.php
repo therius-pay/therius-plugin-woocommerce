@@ -574,9 +574,6 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         // Determine API URL based on environment
         $api_url = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
 
-        // The Therius API expects the private key in the JSON body for these endpoints
-        $body['key'] = $this->private_key;
-
         if ( ! empty( $this->merchant_code ) ) {
             $body['merchantCode'] = $this->merchant_code;
         }
@@ -875,7 +872,6 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         }
 
         $api_url     = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
-        $body['key'] = $this->private_key;
         if ( ! empty( $this->merchant_code ) ) {
             $body['merchantCode'] = $this->merchant_code;
         }
@@ -1155,7 +1151,6 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         }
 
         $body = array(
-            'key'    => $this->private_key,
             'amount' => array(
                 'value'    => $this->to_minor_units( $amount, $order->get_currency() ),
                 'currency' => $order->get_currency(),
