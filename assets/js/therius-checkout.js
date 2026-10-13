@@ -208,6 +208,22 @@ jQuery( function( $ ) {
             this.toggleNativeButton();
         },
 
+        // The shopper's browser data as EMV 3DS wants it (the Accept header is the standard document
+        // value: a page cannot read its own). timeZoneOffset is minutes, UTC minus local.
+        collectBrowserInfo: function() {
+            var scr = window.screen || {};
+            return {
+                acceptHeader: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                language: navigator.language || '',
+                colorDepth: scr.colorDepth || 24,
+                screenWidth: scr.width || 0,
+                screenHeight: scr.height || 0,
+                timeZoneOffset: new Date().getTimezoneOffset(),
+                javaEnabled: false,
+                javascriptEnabled: true
+            };
+        },
+
         // `ddcSessionId` is only set when the SDK is re-invoking the interceptor
         // after a pending_ddc device-data-collection round completed. It rides
         // in the `therius_payment_code` hidden field (name kept as-is — PHP's
@@ -228,6 +244,10 @@ jQuery( function( $ ) {
 
                 // Inject method type
                 $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_method' }).val(methodType).appendTo($form);
+
+                // Cardholder browser data for EMV 3DS (Redsys/Nuvei/Adyen embedded 3DS refuse the payment
+                // without it); PHP can only see the user agent and IP of this request.
+                $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_browser_info' }).val(JSON.stringify(self.collectBrowserInfo())).appendTo($form);
 
                 if ( ddcSessionId ) {
                     $('<input>').attr({ type: 'hidden', class: 'therius_injected_data', name: 'therius_payment_code' }).val(ddcSessionId).appendTo($form);

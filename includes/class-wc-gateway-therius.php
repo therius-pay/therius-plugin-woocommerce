@@ -363,6 +363,41 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
     }
 
     /**
+     * browserInfo for the purchase body: the user agent and IP of this request (the shopper's own
+     * browser), plus the screen/language/time-zone data the checkout JS collected and posted as
+     * therius_browser_info. EMV 3DS run by the provider itself (Redsys, Nuvei, Adyen embedded)
+     * rejects the payment without those fields. Only the known keys are taken, with their types
+     * enforced, so a tampered post cannot add anything else.
+     */
+    private function build_browser_info() {
+        $info = array(
+            'userAgent' => isset( $_SERVER['HTTP_USER_AGENT'] ) ? wc_clean( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : '',
+            'ipAddress' => WC_Geolocation::get_ip_address(),
+        );
+
+        $raw = isset( $_POST['therius_browser_info'] ) ? json_decode( wp_unslash( $_POST['therius_browser_info'] ), true ) : null;
+        if ( ! is_array( $raw ) ) {
+            return $info;
+        }
+        foreach ( array( 'acceptHeader', 'language' ) as $key ) {
+            if ( isset( $raw[ $key ] ) && is_string( $raw[ $key ] ) && '' !== $raw[ $key ] ) {
+                $info[ $key ] = sanitize_text_field( $raw[ $key ] );
+            }
+        }
+        foreach ( array( 'colorDepth', 'screenWidth', 'screenHeight', 'timeZoneOffset' ) as $key ) {
+            if ( isset( $raw[ $key ] ) && is_numeric( $raw[ $key ] ) ) {
+                $info[ $key ] = (int) $raw[ $key ];
+            }
+        }
+        foreach ( array( 'javaEnabled', 'javascriptEnabled' ) as $key ) {
+            if ( isset( $raw[ $key ] ) ) {
+                $info[ $key ] = (bool) $raw[ $key ];
+            }
+        }
+        return $info;
+    }
+
+    /**
      * Build the /payment/purchase request body — shared by the classic
      * process_payment() flow (real $order, order-number-derived order_code)
      * and the Checkout Blocks pre-order AJAX flow (context_from_cart(), a
@@ -390,10 +425,7 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             // mandate_data.customer_acceptance. Valid for the Blocks AJAX path
             // too: it's still the real shopper's own browser making this
             // request (admin-ajax.php), not a server-to-server call.
-            'browserInfo' => array(
-                'userAgent' => isset( $_SERVER['HTTP_USER_AGENT'] ) ? wc_clean( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : '',
-                'ipAddress' => WC_Geolocation::get_ip_address(),
-            ),
+            'browserInfo' => $this->build_browser_info(),
         );
 
         if ( ! empty( $ctx['customer_id'] ) ) {

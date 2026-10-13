@@ -53,6 +53,22 @@
             } );
     }
 
+    // The shopper's browser data as EMV 3DS wants it (the Accept header is the standard document
+    // value: a page cannot read its own). timeZoneOffset is minutes, UTC minus local.
+    function collectBrowserInfo() {
+        var scr = window.screen || {};
+        return {
+            acceptHeader: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            language: navigator.language || '',
+            colorDepth: scr.colorDepth || 24,
+            screenWidth: scr.width || 0,
+            screenHeight: scr.height || 0,
+            timeZoneOffset: new Date().getTimezoneOffset(),
+            javaEnabled: false,
+            javascriptEnabled: true,
+        };
+    }
+
     function generateAttemptId() {
         if ( window.crypto && window.crypto.randomUUID ) {
             return window.crypto.randomUUID();
@@ -101,6 +117,7 @@
                 var fields = {
                     attempt_id: state.attemptId,
                     therius_method: methodType,
+                    therius_browser_info: collectBrowserInfo(),
                 };
                 if ( ddcSessionId ) {
                     fields.therius_payment_code = ddcSessionId;
