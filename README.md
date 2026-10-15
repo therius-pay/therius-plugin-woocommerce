@@ -43,7 +43,7 @@ only learns about them if you configure a webhook.
    mode and one in **Production** mode if you use both.
 2. Copy the signing secret shown for each environment into the plugin's **Test Webhook Signing Secret**
    / **Live Webhook Signing Secret** fields.
-3. Subscribe to at least: `payment.captured`, `payment.refused`, `payment.refunded`, `payment.cancelled`,
+3. Subscribe to at least: `payment.captured`, `payment.refused`, `payment.refunded`, `payment.canceled`,
    `payment.chargeback`.
 
 Without this configured, orders that are only `authorized` (not immediately captured) will sit in

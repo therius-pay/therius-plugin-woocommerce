@@ -276,7 +276,7 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
 
     /**
      * Convert a major-unit amount (e.g. WC order total) to the minor-unit
-     * integer value the Therius API expects, honouring zero-decimal currencies.
+     * integer value the Therius API expects, honoring zero-decimal currencies.
      */
     private function to_minor_units( $major, $currency ) {
         $currency = strtoupper( $currency );
@@ -1301,7 +1301,7 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
                 }
                 break;
 
-            case 'payment.cancelled':
+            case 'payment.canceled':
                 $order->update_status( 'cancelled', __( 'Therius: payment cancelled (confirmed via webhook).', 'therius-woocommerce' ) );
                 break;
 
