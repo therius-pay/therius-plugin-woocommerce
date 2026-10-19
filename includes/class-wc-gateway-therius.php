@@ -770,16 +770,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
 
         $api_url = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
 
-        // GET /payment/inquiry takes no API key, so — unlike purchase/refund,
-        // which resolve sandbox vs. production from the sk_sandbox_/sk_live_
-        // key prefix — it has nothing to derive environment from except this
-        // header, and defaults to production when it's absent. Without it, a
-        // sandbox payment (as here, when testmode is on) simply isn't found:
-        // "Payment does not exist", even though the paymentCode is correct.
+        // GET /payment/inquiry is authenticated with the private key, and the
+        // environment (sandbox vs. production) comes from the key prefix — the
+        // X-Environment header this used to send is ignored.
         $headers = array( 'Authorization' => 'Bearer ' . $this->private_key );
-        if ( $this->testmode ) {
-            $headers['X-Environment'] = 'sandbox';
-        }
 
         // The widget's onActionComplete fires the instant its own /resume (or
         // /3ds_advance) call returns the final status — but that response and
@@ -1100,8 +1094,8 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
      *
      * Returns the id stored on the order at purchase time; for an order paid
      * before that meta existed, resolves it once from the stored paymentCode
-     * via the keyless GET /v1/payment/inquiry/{code} (which also returns the
-     * id) and caches it on the order. Returns '' when it cannot be determined.
+     * via GET /v1/payment/inquiry/{code} (private-key authenticated; it also
+     * returns the id) and caches it on the order. Returns '' when it cannot be determined.
      *
      * @param WC_Order $order
      * @return string
@@ -1118,10 +1112,9 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         }
 
         $api_url = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
-        $headers = array();
-        if ( $this->testmode ) {
-            $headers['X-Environment'] = 'sandbox';
-        }
+        // The inquiry endpoint requires the private key (the environment comes
+        // from the key prefix, not a header).
+        $headers = array( 'Authorization' => 'Bearer ' . $this->private_key );
 
         $response = wp_remote_get( $api_url . '/v1/payment/inquiry/' . rawurlencode( $payment_code ), array(
             'headers' => $headers,
