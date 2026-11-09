@@ -1294,7 +1294,8 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         switch ( $event ) {
             case 'payment.captured':
                 if ( ! $order->has_status( array( 'processing', 'completed' ) ) ) {
-                    $order->payment_complete( isset( $payload['payment_code'] ) ? $payload['payment_code'] : '' );
+                    $code = ! empty( $payload['paymentCode'] ) ? $payload['paymentCode'] : ( ! empty( $payload['payment_code'] ) ? $payload['payment_code'] : '' );
+                    $order->payment_complete( $code );
                     $order->add_order_note( __( 'Therius: payment captured (confirmed via webhook).', 'therius-woocommerce' ) );
                 }
                 break;
@@ -1359,10 +1360,11 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
      * paymentCode, which the webhook payload separately carries as payment_code.
      */
     private function find_order_for_webhook( $payload ) {
-        if ( ! empty( $payload['payment_code'] ) ) {
+        $paymentCode = ! empty( $payload['paymentCode'] ) ? $payload['paymentCode'] : ( ! empty( $payload['payment_code'] ) ? $payload['payment_code'] : '' );
+        if ( ! empty( $paymentCode ) ) {
             $orders = wc_get_orders( array(
                 'meta_key'   => '_therius_payment_code',
-                'meta_value' => $payload['payment_code'],
+                'meta_value' => $paymentCode,
                 'limit'      => 1,
                 'return'     => 'objects',
             ) );
@@ -1371,10 +1373,11 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             }
         }
 
-        // order_code was set to $order->get_order_number(), which is the
+        // orderCode was set to $order->get_order_number(), which is the
         // order ID unless a sequential-order-number plugin is active.
-        if ( ! empty( $payload['order_code'] ) && is_numeric( $payload['order_code'] ) ) {
-            $order = wc_get_order( (int) $payload['order_code'] );
+        $orderCode = ! empty( $payload['orderCode'] ) ? $payload['orderCode'] : ( ! empty( $payload['order_code'] ) ? $payload['order_code'] : '' );
+        if ( ! empty( $orderCode ) && is_numeric( $orderCode ) ) {
+            $order = wc_get_order( (int) $orderCode );
             if ( $order ) {
                 return $order;
             }
