@@ -5,6 +5,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class WC_Gateway_Therius extends WC_Payment_Gateway {
 
+    const PRESENTER_CODE = 'woocommerce';
+
     // Currencies with no minor unit — the major amount IS the minor-unit
     // value (no ×100), exponent 0. Matches therius-sdk-example/src/lib/amount.ts.
     private static $zero_decimal_currencies = array(
@@ -213,8 +215,9 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
             $response = wp_remote_post( $api_url . '/v1/sdk/session', array(
                 'method'    => 'POST',
                 'headers'   => array(
-                    'Authorization' => 'Bearer ' . $this->private_key,
-                    'Content-Type'  => 'application/json',
+                    'Authorization'          => 'Bearer ' . $this->private_key,
+                    'Content-Type'           => 'application/json',
+                    'Therius-Presenter-Code' => self::PRESENTER_CODE,
                 ),
                 'body'      => wp_json_encode( $session_body ),
             ) );
@@ -649,9 +652,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         $response = wp_remote_post( $api_url . '/v1/payment/purchase', array(
             'method'    => 'POST',
             'headers'   => array(
-                'Authorization'   => 'Bearer ' . $this->private_key,
-                'Content-Type'    => 'application/json',
-                'Idempotency-Key' => $idempotency_key,
+                'Authorization'          => 'Bearer ' . $this->private_key,
+                'Content-Type'           => 'application/json',
+                'Idempotency-Key'        => $idempotency_key,
+                'Therius-Presenter-Code' => self::PRESENTER_CODE,
             ),
             'body'      => wp_json_encode( $body ),
             'timeout'   => 45,
@@ -773,7 +777,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         // GET /payment/inquiry is authenticated with the private key, and the
         // environment (sandbox vs. production) comes from the key prefix — the
         // X-Environment header this used to send is ignored.
-        $headers = array( 'Authorization' => 'Bearer ' . $this->private_key );
+        $headers = array(
+            'Authorization'          => 'Bearer ' . $this->private_key,
+            'Therius-Presenter-Code' => self::PRESENTER_CODE,
+        );
 
         // The widget's onActionComplete fires the instant its own /resume (or
         // /3ds_advance) call returns the final status — but that response and
@@ -916,9 +923,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         $response = wp_remote_post( $api_url . '/v1/payment/purchase', array(
             'method'    => 'POST',
             'headers'   => array(
-                'Authorization'   => 'Bearer ' . $this->private_key,
-                'Content-Type'    => 'application/json',
-                'Idempotency-Key' => $idempotency_key,
+                'Authorization'          => 'Bearer ' . $this->private_key,
+                'Content-Type'           => 'application/json',
+                'Idempotency-Key'        => $idempotency_key,
+                'Therius-Presenter-Code' => self::PRESENTER_CODE,
             ),
             'body'      => wp_json_encode( $body ),
             'timeout'   => 45,
@@ -980,7 +988,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
 
         $expected_order_code = 'wcbx_' . $attempt_id;
         $api_url              = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
-        $headers              = array( 'Authorization' => 'Bearer ' . $this->private_key );
+        $headers              = array(
+            'Authorization'          => 'Bearer ' . $this->private_key,
+            'Therius-Presenter-Code' => self::PRESENTER_CODE,
+        );
         if ( $this->testmode ) {
             $headers['X-Environment'] = 'sandbox';
         }
@@ -1114,7 +1125,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         $api_url = $this->testmode ? 'https://api-sandbox.therius.io' : 'https://api.therius.io';
         // The inquiry endpoint requires the private key (the environment comes
         // from the key prefix, not a header).
-        $headers = array( 'Authorization' => 'Bearer ' . $this->private_key );
+        $headers = array(
+            'Authorization'          => 'Bearer ' . $this->private_key,
+            'Therius-Presenter-Code' => self::PRESENTER_CODE,
+        );
 
         $response = wp_remote_get( $api_url . '/v1/payment/inquiry/' . rawurlencode( $payment_code ), array(
             'headers' => $headers,
@@ -1191,9 +1205,10 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         $response = wp_remote_post( $api_url . '/v1/payment/' . rawurlencode( $payment_id ) . '/refund', array(
             'method'  => 'POST',
             'headers' => array(
-                'Authorization'   => 'Bearer ' . $this->private_key,
-                'Content-Type'    => 'application/json',
-                'Idempotency-Key' => $idempotency_key,
+                'Authorization'          => 'Bearer ' . $this->private_key,
+                'Content-Type'           => 'application/json',
+                'Idempotency-Key'        => $idempotency_key,
+                'Therius-Presenter-Code' => self::PRESENTER_CODE,
             ),
             'body'    => wp_json_encode( $body ),
             'timeout' => 45,
@@ -1393,8 +1408,9 @@ class WC_Gateway_Therius extends WC_Payment_Gateway {
         $response = wp_remote_post( $api_url . '/v1/sdk/session', array(
             'method'  => 'POST',
             'headers' => array(
-                'Authorization' => 'Bearer ' . $this->private_key,
-                'Content-Type'  => 'application/json',
+                'Authorization'          => 'Bearer ' . $this->private_key,
+                'Content-Type'           => 'application/json',
+                'Therius-Presenter-Code' => self::PRESENTER_CODE,
             ),
             'body'    => wp_json_encode( $session_body ),
         ) );
